@@ -2,51 +2,59 @@ package main
 
 import (
 	"fmt"
-	"math/rand"
-	"net/http"
-	"net/url"
+	"log"
 	"time"
 )
 
-/* target, err := url.Parse(targetURL)
-if err != nil {
-	return fmt.Errorf("Error parsing target URL:", err)
-} */
-
-const capacity = 15
-
-type Retrier struct {
-	queue    chan *http.Request
-	capacity int
-	timeout  time.Duration
-	target   *url.URL
+type Item[T any] struct {
+	I          T
+	RetryCount uint
+	Time       time.Time
 }
 
-func NewRetrier(targetURL string) (*Retrier, error) {
-	u, err := url.Parse(targetURL)
-	if err != nil {
-		return nil, err
+type Action[T any] func(Item[T]) error
+
+type Retrier[T any] struct {
+	queue        chan Item[T]
+	capacity     int
+	timeout      time.Duration
+	action       Action[T]
+	abortOnError bool
+	maxRetries   uint
+	maxAge       time.Duration
+}
+
+func NewRetrier[T any](timeout time.Duration, capacity int, abortOnError bool, action Action[T]) *Retrier[T] {
+	return &Retrier[T]{
+		capacity:     capacity,
+		queue:        make(chan Item[T], capacity),
+		timeout:      timeout,
+		action:       action,
+		abortOnError: abortOnError,
 	}
-	return &Retrier{
-		capacity: capacity,
-		queue:    make(chan *http.Request, 2*capacity),
-		timeout:  10 * time.Second,
-		target:   u,
-	}, nil
 }
 
-func (ret *Retrier) Add(req *http.Request) error {
+func (ret *Retrier[T]) Add(i T) error {
+	item := Item[T]{
+		I:          i,
+		RetryCount: 0,
+		Time:       time.Now(),
+	}
 
-	if len(ret.queue)*2 == cap(ret.queue) {
+	log.Print("adding item: ")
+	select {
+	case ret.queue <- item:
+		log.Println("ok")
+	default:
+		log.Println("queue is full")
 		return fmt.Errorf("the queue is full")
 	}
 
-	ret.queue <- req
 	return nil
 }
 
-func (ret *Retrier) Start() error {
-	ticker := time.NewTicker(time.Second * 3)
+func (ret *Retrier[T]) Start() error {
+	ticker := time.NewTicker(ret.timeout)
 	go func() {
 		for {
 			<-ticker.C
@@ -57,46 +65,61 @@ func (ret *Retrier) Start() error {
 	return nil
 }
 
-func (ret *Retrier) Retry() {
+func (ret *Retrier[T]) Retry() {
+
 	n := len(ret.queue)
-	fmt.Printf("Retrying (%d) elements\n", n)
+	if n == 0 {
+		return
+	}
+
+	log.Printf("retrying (%d) elements\n", n)
 	for k := 0; k < n; k++ {
-		r := <-ret.queue
-		err := ret.Process(r)
-		if err != nil {
-			fmt.Printf("retry failed with error: %s\n", err)
-			ret.queue <- r
+		i := <-ret.queue
+		i.RetryCount += 1
+
+		log.Printf("\tretry %s", nOfMaxStr(i.RetryCount, ret.maxRetries))
+
+		if time.Since(i.Time) >= ret.maxAge {
+			log.Printf("\tmax age reached (%s)\n", ret.maxAge)
 			continue
 		}
-		fmt.Println("retry success")
-		continue
 
+		err := ret.action(i)
+		if err != nil {
+			log.Printf("\tfailed with error: %s\n", err)
+
+			if ret.maxRetries == 0 || i.RetryCount < ret.maxRetries {
+				ret.queue <- i
+			} else {
+				log.Printf("\tmax number of retries reached (%s)\n", nOfMaxStr(i.RetryCount, ret.maxRetries))
+			}
+
+			if ret.abortOnError {
+				log.Println("aborting...")
+				// Remove and reinsert remaining items in queue
+				for k += 1; k < n; k++ {
+					i = <-ret.queue
+					ret.queue <- i
+				}
+				return
+			}
+
+			continue
+		}
+		// No errors, success!
+		log.Printf("\tsuccess after %d retries / %s \n", i.RetryCount, time.Since(i.Time).Round(time.Second))
+	}
+
+	if len(ret.queue) == 0 {
+		log.Println("queue is empty")
 	}
 
 }
 
-func (ret *Retrier) Process(r *http.Request) error {
-
-	var client = &http.Client{
-		Timeout: time.Second * 2,
+func nOfMaxStr(n, max uint) string {
+	if max != 0 {
+		return fmt.Sprintf("%d of %d", n, max)
+	} else {
+		return fmt.Sprintf("%d", n)
 	}
-
-	//fmt.Println(r)
-	// Use the default HTTP client to send the request to the target server
-	resp, err := client.Do(r)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	//fmt.Println(resp)
-
-	statusOK := resp.StatusCode >= 200 && resp.StatusCode < 300
-	if !statusOK {
-		return fmt.Errorf("service responded with %s", http.StatusText(resp.StatusCode))
-	}
-	return nil
-}
-
-func RandBool() bool {
-	return rand.Intn(2) == 1
 }
