@@ -15,8 +15,9 @@ type Item[T any] struct {
 type Action[T any] func(Item[T]) error
 
 type Retrier[T any] struct {
-	queue        chan Item[T]
+	items        chan Item[T]
 	capacity     int
+	queue        chan Item[T]
 	timeout      time.Duration
 	action       Action[T]
 	abortOnError bool
@@ -28,6 +29,7 @@ func NewRetrier[T any](timeout time.Duration, capacity int, abortOnError bool, a
 	return &Retrier[T]{
 		capacity:     capacity,
 		queue:        make(chan Item[T], capacity),
+		items:        make(chan Item[T], capacity),
 		timeout:      timeout,
 		action:       action,
 		abortOnError: abortOnError,
@@ -41,10 +43,10 @@ func (ret *Retrier[T]) Add(i T) error {
 		Time:       time.Now(),
 	}
 
-	log.Print("adding item: ")
+	//log.Print("adding item")
 	select {
 	case ret.queue <- item:
-		log.Println("ok")
+		log.Println("item successfully added to queue")
 	default:
 		log.Println("queue is full")
 		return fmt.Errorf("the queue is full")
@@ -67,19 +69,31 @@ func (ret *Retrier[T]) Start() error {
 
 func (ret *Retrier[T]) Retry() {
 
-	n := len(ret.queue)
+out:
+	for len(ret.queue) > 0 {
+		i := <-ret.queue
+		select {
+		case ret.items <- i:
+			log.Println("item successfully added to active list")
+		default:
+			log.Println("full capacity")
+			break out
+		}
+	}
+
+	n := len(ret.items)
 	if n == 0 {
 		return
 	}
 
 	log.Printf("retrying (%d) elements\n", n)
 	for k := 0; k < n; k++ {
-		i := <-ret.queue
+		i := <-ret.items
 		i.RetryCount += 1
 
-		log.Printf("\tretry %s", nOfMaxStr(i.RetryCount, ret.maxRetries))
+		log.Printf("\tretry n. %s", nOfMaxStr(i.RetryCount, ret.maxRetries))
 
-		if time.Since(i.Time) >= ret.maxAge {
+		if ret.maxAge > 0 && time.Since(i.Time) >= ret.maxAge {
 			log.Printf("\tmax age reached (%s)\n", ret.maxAge)
 			continue
 		}
@@ -89,7 +103,7 @@ func (ret *Retrier[T]) Retry() {
 			log.Printf("\tfailed with error: %s\n", err)
 
 			if ret.maxRetries == 0 || i.RetryCount < ret.maxRetries {
-				ret.queue <- i
+				ret.items <- i
 			} else {
 				log.Printf("\tmax number of retries reached (%s)\n", nOfMaxStr(i.RetryCount, ret.maxRetries))
 			}
@@ -98,8 +112,8 @@ func (ret *Retrier[T]) Retry() {
 				log.Println("aborting...")
 				// Remove and reinsert remaining items in queue
 				for k += 1; k < n; k++ {
-					i = <-ret.queue
-					ret.queue <- i
+					i = <-ret.items
+					ret.items <- i
 				}
 				return
 			}
@@ -110,7 +124,7 @@ func (ret *Retrier[T]) Retry() {
 		log.Printf("\tsuccess after %d retries / %s \n", i.RetryCount, time.Since(i.Time).Round(time.Second))
 	}
 
-	if len(ret.queue) == 0 {
+	if len(ret.items) == 0 {
 		log.Println("queue is empty")
 	}
 

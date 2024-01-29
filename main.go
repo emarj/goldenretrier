@@ -177,6 +177,7 @@ func RetryRequest(r Item[*http.Request]) error {
 		log.Printf("--- Request ---\n%s\n---\n", string(dump))
 	}
 
+	log.Println("\t", "making request")
 	// Use the default HTTP client to send the request to the target server
 	res, err := client.Do(req)
 	if err != nil {
